@@ -263,6 +263,7 @@ if(SPECULOS AND SPECULOS_SRC)
     ../src/handler/lib/stream_merkleized_map_value.c
     ../src/handler/lib/stream_preimage.c
     ../src/handler/sign_psbt/extract_bip32_derivation.c
+    ../src/handler/sign_psbt/psbt_fields.c
     ../src/handler/sign_psbt/sign_psbt_cache.c
     ../src/musig/musig.c
     $ENV{BOLOS_SDK}/lib_standard_app/crypto_helpers.c
@@ -307,13 +308,14 @@ if(SPECULOS AND SPECULOS_SRC)
   add_unit_test(test_stream_merkleized_map_value  LIBS test_merkle_common)
   add_unit_test(test_get_merkleized_map        LIBS test_merkle_common)
   add_unit_test(test_get_merkleized_map_value  LIBS test_merkle_common)
+  add_unit_test(test_psbt_fields               LIBS test_merkle_common)
 
   foreach(t
     test_get_preimage test_get_merkle_preimage test_extract_bip32_derivation
     test_check_merkle_tree_sorted test_get_merkle_leaf_element
     test_get_merkle_leaf_hash test_get_merkle_leaf_index test_stream_preimage
     test_stream_merkle_leaf_element test_stream_merkleized_map_value
-    test_get_merkleized_map test_get_merkleized_map_value)
+    test_get_merkleized_map test_get_merkleized_map_value test_psbt_fields)
     app_apply_real_sdk_config(${t})
   endforeach()
 
@@ -329,6 +331,18 @@ if(SPECULOS AND SPECULOS_SRC)
   app_apply_real_sdk_config(test_script)
   target_link_libraries(test_script PRIVATE cmocka app_crypto)
   add_test(test_script test_script)
+
+  # test_bip322 exercises the BIP-322 to_spend construction (serialization and txid) and the
+  # message detection/hashing pass (bip322_detect, through the mock dispatcher) against the
+  # vectors of the BIP (specs/bip322/, rendered into bip322_vectors.inc.c by gen.py).
+  # bip322.c is compiled into the test directly (it is not part of app_crypto); the UI/flow
+  # symbols it references are stubbed in the test file.
+  add_executable(test_bip322 test_bip322.c ../src/handler/sign_psbt/bip322.c)
+  app_apply_real_sdk_config(test_bip322)
+  target_include_directories(test_bip322 BEFORE PRIVATE ../src/ui)
+  target_link_libraries(test_bip322 PRIVATE cmocka mock_dispatcher app_crypto buffer buffer_ext
+                        varint read write bip32)
+  add_test(test_bip322 test_bip322)
 
   # test_sighash exercises classify_sighash (src/common/sighash.h), which only
   # depends on constants.h (and therefore the real SDK headers). No app object

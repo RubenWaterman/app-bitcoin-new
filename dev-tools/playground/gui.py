@@ -88,10 +88,7 @@ def _preset_choices(presets) -> list[tuple[str, str]]:
     """
     out: list[tuple[str, str]] = [("(no preset)", NO_PRESET)]
     for p in presets:
-        desc = p.description
-        if len(desc) > 70:
-            desc = desc[:67] + "..."
-        out.append((f"{p.name} — {desc}", p.name))
+        out.append((f"{p.name} — {p.description}", p.name))
     return out
 
 
@@ -247,6 +244,14 @@ class PlaygroundApp(App):
     .form-row Input {
         width: 1fr;
     }
+    /* Preset dropdowns. Without this, a long `name — description` label wraps
+       onto several lines, which pushes most of the preset names out of the
+       overlay; one line per preset keeps every name in view. */
+    Select > SelectOverlay {
+        max-height: 20;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
+    }
     .keys-area {
         height: 6;
     }
@@ -305,6 +310,7 @@ class PlaygroundApp(App):
 
         # State carried from a sign-psbt preset selection to the next Run.
         # Reset whenever a new preset is picked on the sign-psbt tab.
+        self._sign_psbt_spec: Optional[Any] = None
         self._sign_psbt_mutator: Optional[Callable[[Any], Any]] = None
         self._sign_psbt_external_xprivs: List[str] = []
 
@@ -438,8 +444,9 @@ class PlaygroundApp(App):
         if event.value == NO_PRESET:
             # Picking the sentinel leaves the form alone; also clear any
             # sign-psbt-only state so a subsequent Run doesn't apply a
-            # stale mutator or xpriv list.
+            # stale spec, mutator or xpriv list.
             if tab_id == "sign":
+                self._sign_psbt_spec = None
                 self._sign_psbt_mutator = None
                 self._sign_psbt_external_xprivs = []
             return
@@ -462,6 +469,7 @@ class PlaygroundApp(App):
             return
 
         if tab_id == "sign":
+            self._sign_psbt_spec = preset.psbt_spec
             self._sign_psbt_mutator = preset.psbt_mutator
             self._sign_psbt_external_xprivs = []  # filled by resolver below
 
@@ -589,7 +597,12 @@ class PlaygroundApp(App):
         cleanup_tmp: Optional[Path] = None
 
         if not psbt_raw:
-            psbt_label = f"--inputs {inputs} --outputs {outputs}"
+            # A preset spec defines its own inputs/outputs, so --inputs/--outputs
+            # are ignored in that case.
+            psbt_label = (
+                "from preset spec" if self._sign_psbt_spec is not None
+                else f"--inputs {inputs} --outputs {outputs}"
+            )
         elif psbt_raw.startswith(PSBT_BASE64_PREFIX):
             tmp_dir = Path(tempfile.gettempdir()) / "btcapp-playground"
             tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -605,15 +618,17 @@ class PlaygroundApp(App):
             fixture = psbt_raw
             psbt_label = f"--fixture {fixture}"
 
-        # Preset state: mutator only applies to *generated* PSBTs; if the user
-        # supplied a fixture, leave it alone. External xprivs flow through to
-        # musig2 e2e signing regardless.
+        # Preset state: the spec/mutator only apply to *generated* PSBTs; if the
+        # user supplied a fixture, leave it alone. External xprivs flow through
+        # to musig2 e2e signing regardless.
+        psbt_spec = self._sign_psbt_spec if fixture is None else None
         psbt_mutator = self._sign_psbt_mutator if fixture is None else None
         external_xprivs = list(self._sign_psbt_external_xprivs)
 
         flags = (
             f'--name "{name}" {psbt_label}'
             + (" --no-cache" if no_cache else "")
+            + ("  [spec]" if psbt_spec else "")
             + (f"  [mutator={psbt_mutator.__name__}]" if psbt_mutator else "")
             + (f"  [{len(external_xprivs)} ext xpriv(s)]" if external_xprivs else "")
         )
@@ -621,6 +636,7 @@ class PlaygroundApp(App):
                        name=name, template=template, keys=keys,
                        fixture=fixture, inputs=inputs, outputs=outputs,
                        no_cache=no_cache,
+                       psbt_spec=psbt_spec,
                        psbt_mutator=psbt_mutator,
                        external_xprivs=external_xprivs,
                        _cleanup_tmp=cleanup_tmp)

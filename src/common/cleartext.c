@@ -125,15 +125,6 @@ static uint8_t admitting_pattern_count(const cleartext_spec_t *spec, const ct_bi
 // but in practice ≤ ~30 occurrences).
 #define CT_MAX_KEYEXPRS 32
 
-typedef struct {
-    // Canonical identity: the first key expression seen in the group. Equality
-    // is determined via are_key_placeholders_identical (from policy.h).
-    const policy_node_keyexpr_t *repr;
-    // Derivation pairs collected for this class.
-    uint32_t pairs[CT_MAX_KEYEXPRS][2];
-    uint8_t n_pairs;
-} ct_keyexpr_class_t;
-
 // Saturating factorial.
 static uint64_t sat_factorial(uint32_t n) {
     uint64_t f = 1;
@@ -183,67 +174,69 @@ static uint64_t key_orderings_count(const policy_node_t *root, bool *out_canonic
         kx[i] = k;
     }
 
-    // Group by identity. classes[i].repr is the first keyexpr in the group;
-    // classes[i].pairs collects (num_first, num_second) for each occurrence.
-    ct_keyexpr_class_t classes[CT_MAX_KEYEXPRS];
+    // Group by identity: class_of[i] is the class of kx[i], and class_repr[c] is the index of the
+    // first keyexpr seen in class c (its canonical identity). Equality is determined via
+    // are_key_placeholders_identical (from policy.h).
+    uint8_t class_of[CT_MAX_KEYEXPRS];
+    uint8_t class_repr[CT_MAX_KEYEXPRS];
     int n_classes = 0;
 
     for (int i = 0; i < n; i++) {
-        const policy_node_keyexpr_t *k = kx[i];
         int idx = -1;
         for (int j = 0; j < n_classes; j++) {
-            if (are_key_placeholders_identical(classes[j].repr, k)) {
+            if (are_key_placeholders_identical(kx[class_repr[j]], kx[i])) {
                 idx = j;
                 break;
             }
         }
         if (idx < 0) {
-            if (n_classes >= CT_MAX_KEYEXPRS) {
-                *out_canonical = false;
-                return UINT64_MAX;
-            }
-            classes[n_classes].repr = k;
-            classes[n_classes].n_pairs = 0;
+            // there can't be more classes than key expressions, hence no bound check is needed
+            class_repr[n_classes] = (uint8_t) i;
             idx = n_classes++;
         }
-        if (classes[idx].n_pairs >= CT_MAX_KEYEXPRS) {
-            *out_canonical = false;
-            return UINT64_MAX;
-        }
-        classes[idx].pairs[classes[idx].n_pairs][0] = k->num_first;
-        classes[idx].pairs[classes[idx].n_pairs][1] = k->num_second;
-        classes[idx].n_pairs++;
+        class_of[i] = (uint8_t) idx;
     }
 
     // Canonical check: group by full key identity (musig groups stay whole) and
     // require each group's sorted derivation pairs to be (0,1),(2,3),(4,5),...
+    // The pairs are collected one class at a time, since all the classes together have exactly n
+    // pairs in total.
+    uint32_t pairs[CT_MAX_KEYEXPRS][2];
     *out_canonical = true;
-    for (int i = 0; i < n_classes; i++) {
-        sort_pairs(classes[i].pairs, classes[i].n_pairs);
-        for (uint8_t j = 0; j < classes[i].n_pairs; j++) {
-            if (classes[i].pairs[j][0] != (uint32_t) (2 * j) ||
-                classes[i].pairs[j][1] != (uint32_t) (2 * j + 1)) {
+    for (int c = 0; c < n_classes; c++) {
+        uint8_t n_pairs = 0;
+        for (int i = 0; i < n; i++) {
+            if (class_of[i] != c) continue;
+            pairs[n_pairs][0] = kx[i]->num_first;
+            pairs[n_pairs][1] = kx[i]->num_second;
+            ++n_pairs;
+        }
+
+        sort_pairs(pairs, n_pairs);
+        for (uint8_t j = 0; j < n_pairs; j++) {
+            if (pairs[j][0] != (uint32_t) (2 * j) || pairs[j][1] != (uint32_t) (2 * j + 1)) {
                 *out_canonical = false;
             }
         }
     }
 
     // Compute an upper bound on the possible number of orderings for the
-    // derivation pairs.
-    uint32_t idx_vals[CT_MAX_KEYEXPRS * MAX_PUBKEYS_PER_MUSIG];
-    uint32_t idx_cnts[CT_MAX_KEYEXPRS * MAX_PUBKEYS_PER_MUSIG];
+    // derivation pairs. Each of the at most CT_MAX_KEYEXPRS key expressions contributes at most
+    // MAX_PUBKEYS_PER_MUSIG plain keys, therefore each count fits in a uint8_t.
+    uint16_t idx_vals[CT_MAX_KEYEXPRS * MAX_PUBKEYS_PER_MUSIG];
+    uint8_t idx_cnts[CT_MAX_KEYEXPRS * MAX_PUBKEYS_PER_MUSIG];
     int n_idx = 0;
     for (int i = 0; i < n; i++) {
         const policy_node_keyexpr_t *k = kx[i];
         // Build the list of plain key indices contributed by this keyexpr.
-        uint32_t members[MAX_PUBKEYS_PER_MUSIG];
+        uint16_t members[MAX_PUBKEYS_PER_MUSIG];
         uint16_t n_members;
         if (k->type == KEY_EXPRESSION_NORMAL) {
             members[0] = k->k.key_index;
             n_members = 1;
         } else {
-            const musig_aggr_key_info_t *ai = r_musig_aggr_key_info(&k->m.musig_info);
-            const uint16_t *ak = r_uint16(&ai->key_indexes);
+            const musig_aggr_key_info_t *ai = k->m.musig_info;
+            const uint16_t *ak = ai->key_indexes;
             n_members = ai->n;
             for (uint16_t j = 0; j < n_members; j++) members[j] = ak[j];
         }
@@ -280,7 +273,7 @@ static uint64_t key_orderings_count(const policy_node_t *root, bool *out_canonic
 static uint16_t keys_member_count(const ct_value_t *v) {
     if (v->u.keys.n == 1 && v->u.keys.array != NULL &&
         v->u.keys.array[0].type == KEY_EXPRESSION_MUSIG) {
-        return r_musig_aggr_key_info(&v->u.keys.array[0].m.musig_info)->n;
+        return v->u.keys.array[0].m.musig_info->n;
     }
     return v->u.keys.n;
 }
@@ -289,8 +282,8 @@ static uint16_t keys_member_count(const ct_value_t *v) {
 static uint32_t keys_member_index(const ct_value_t *v, uint16_t j) {
     if (v->u.keys.n == 1 && v->u.keys.array != NULL &&
         v->u.keys.array[0].type == KEY_EXPRESSION_MUSIG) {
-        const musig_aggr_key_info_t *mi = r_musig_aggr_key_info(&v->u.keys.array[0].m.musig_info);
-        return r_uint16(&mi->key_indexes)[j];
+        const musig_aggr_key_info_t *mi = v->u.keys.array[0].m.musig_info;
+        return mi->key_indexes[j];
     }
     return v->u.keys.array[j].k.key_index;
 }
@@ -307,13 +300,13 @@ static int compare_uint32(uint32_t left, uint32_t right) {
 
 static int compare_musig_keyexprs(const policy_node_keyexpr_t *left,
                                   const policy_node_keyexpr_t *right) {
-    const musig_aggr_key_info_t *left_info = r_musig_aggr_key_info(&left->m.musig_info);
-    const musig_aggr_key_info_t *right_info = r_musig_aggr_key_info(&right->m.musig_info);
+    const musig_aggr_key_info_t *left_info = left->m.musig_info;
+    const musig_aggr_key_info_t *right_info = right->m.musig_info;
     int order = compare_uint16(left_info->n, right_info->n);
     if (order != 0) return order;
 
-    const uint16_t *left_indexes = r_uint16(&left_info->key_indexes);
-    const uint16_t *right_indexes = r_uint16(&right_info->key_indexes);
+    const uint16_t *left_indexes = left_info->key_indexes;
+    const uint16_t *right_indexes = right_info->key_indexes;
     for (uint16_t i = 0; i < left_info->n; i++) {
         order = compare_uint16(left_indexes[i], right_indexes[i]);
         if (order != 0) return order;
@@ -458,8 +451,8 @@ static int append_keyexpr(char *out, size_t cap, size_t *off, const policy_node_
         return append_str(out, cap, off, buf);
     }
     // KEY_EXPRESSION_MUSIG: "musig(@a,@b,@c)"
-    const musig_aggr_key_info_t *mi = r_musig_aggr_key_info(&key->m.musig_info);
-    const uint16_t *idx = r_uint16(&mi->key_indexes);
+    const musig_aggr_key_info_t *mi = key->m.musig_info;
+    const uint16_t *idx = mi->key_indexes;
     if (append_str(out, cap, off, "musig(") < 0) return -1;
     for (uint16_t i = 0; i < mi->n; i++) {
         char buf[8];
@@ -482,8 +475,8 @@ static int append_keys_list(char *out,
     // tr(musig(...)) forms). In that case render the inner keys as a flat
     // Oxford-comma list (without "musig(...)" wrapping).
     if (n == 1 && keys->type == KEY_EXPRESSION_MUSIG) {
-        const musig_aggr_key_info_t *mi = r_musig_aggr_key_info(&keys->m.musig_info);
-        const uint16_t *idx = r_uint16(&mi->key_indexes);
+        const musig_aggr_key_info_t *mi = keys->m.musig_info;
+        const uint16_t *idx = mi->key_indexes;
         uint16_t m = mi->n;
         for (uint16_t i = 0; i < m; i++) {
             if (i > 0) {
@@ -717,11 +710,11 @@ static int collect_leaves(const policy_node_tree_t *tree,
     if (tree == NULL) return 0;
     if (tree->is_leaf) {
         if (*n >= max) return -1;
-        out[(*n)++] = r_policy_node(&tree->script);
+        out[(*n)++] = tree->script;
         return 0;
     }
-    if (collect_leaves(r_policy_node_tree(&tree->left_tree), out, n, max) < 0) return -1;
-    return collect_leaves(r_policy_node_tree(&tree->right_tree), out, n, max);
+    if (collect_leaves(tree->left_tree, out, n, max) < 0) return -1;
+    return collect_leaves(tree->right_tree, out, n, max);
 }
 
 // ---------------------------------------------------------------------------

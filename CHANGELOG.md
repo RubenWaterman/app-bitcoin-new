@@ -11,12 +11,19 @@ Dates are in `dd-mm-yyyy` format.
 
 ### Added
 
-- Enable stack protector
+- Support for [BIP-0322](https://github.com/bitcoin/bips/blob/master/bip-0322.mediawiki) (v2.0.0) generic signed messages: a PSBT carrying the `PSBT_GLOBAL_GENERIC_SIGNED_MESSAGE` global field (0x09) is now verified to have the exact BIP-322 *to_sign* structure and reviewed on-screen as a message signature (account, address and message), instead of being shown as a transaction with an `OP_RETURN` output and no fees. Proof-of-funds requests (additional inputs spending real coins of the account, sorted in BIP-69 order) are supported, with the total proven amount shown in the review. Works with any supported wallet policy, including multisig and miniscript.
+- Stateful, SDK-native fuzzing framework (Absolution-based) with semantic continuation host for `SIGN_PSBT` (developer tooling).
+
+## [2.5.0] - 24-07-2026
 
 ### Changed
 
 - Improved the registration UX for multisig and many taproot miniscript wallet policies by showing the *clear-text, human-readable* meaning of the policy. For simple multisig policies, the clear-text description replaces the descriptor template. For a large class of supported taproot miniscript policies, it is shown *in addition to*, and *before*, the raw descriptor template. This lets the user understand the policy while still being able to compare the template against their backup.
+- Signing transactions using non-standard sighash flags now requires enabling the corresponding persistent application setting.
+- Improved the signing display for transactions using non-default sighash flags: the effective signing rule is shown, and the trusted screen now only presents amounts that the signatures actually commit to, falling back to the net amount spent/received (or a warning when nothing can be shown reliably) instead of a potentially misleading breakdown.
+- Improved the signing display for transactions with external inputs: in addition to the existing warning and external outputs, the trusted screen now shows the total amount of the external inputs when it can be reliably determined, and the net amount spent from or received into the account.
 - Standard BIP-87 xpubs can now be exported without explicit user confirmation.
+- Enabled stack protector.
 
 ## [2.4.6] - 30-03-2026
 

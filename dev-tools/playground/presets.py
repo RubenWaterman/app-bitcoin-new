@@ -12,9 +12,11 @@ Two flavors:
 
 - `PolicyPreset` — a complete wallet policy (descriptor template + per-`@N`
   `KeySpec`). Fills the wallet-name / template / keys fields on the
-  register-wallet / get-address / sign-psbt tabs. For sign-psbt only, an
-  optional `psbt_mutator` is applied to the generated fake PSBT just
-  before signing — used for scenario presets like "huge-fee".
+  register-wallet / get-address / sign-psbt tabs. For sign-psbt only, the
+  fake PSBT to sign can be shaped in two ways: a declarative `PsbtSpec`
+  (preferred — describes inputs/outputs, including external inputs, as data)
+  or a `psbt_mutator` escape hatch (a callable that tweaks the generated
+  PSBT). When both are set, the spec builds it and the mutator tweaks it.
 
 The CLI does not use presets: it accepts a fully-resolved policy via
 inline `--template` / `--key` / `--name` flags.
@@ -119,6 +121,142 @@ XPUB_PRESETS: List[XpubPreset] = [
 ]
 
 
+# ----- declarative sign-psbt shapes -----------------------------------------
+
+# SIGHASH flag bytes. The low bits pick the base type; ANYONECANPAY (0x80) is a
+# modifier OR-ed on top (e.g. SIGHASH_ALL | SIGHASH_ANYONECANPAY == 0x81). The
+# app rejects a bare 0x80 and SIGHASH_DEFAULT (0x00) on segwitv0, so always OR
+# ANYONECANPAY with a base type. Signing a non-default sighash also needs the
+# device's "non-standard sighash" setting enabled.
+SIGHASH_ALL = 0x01
+SIGHASH_NONE = 0x02
+SIGHASH_SINGLE = 0x03
+SIGHASH_ANYONECANPAY = 0x80
+
+
+@dataclass(frozen=True)
+class PsbtInputSpec:
+    """One input of a `PsbtSpec`."""
+    amount: int
+    external: bool = False        # True => a foreign input the wallet can't sign
+    sighash: Optional[int] = None  # None => default; else a SIGHASH_* byte (PSBT_IN_SIGHASH_TYPE)
+
+
+@dataclass(frozen=True)
+class PsbtOutputSpec:
+    """One output of a `PsbtSpec`. `amount=None` marks the single "remainder"
+    output that absorbs whatever value is left after the explicit outputs and
+    the fee — set it on the change output to produce a net receive."""
+    amount: Optional[int] = None
+    is_change: bool = False  # True => wallet change (internal)
+
+
+@dataclass(frozen=True)
+class PsbtSpec:
+    """A declarative description of the fake PSBT a sign-psbt preset wants.
+
+    Turned into a `test_utils.txmaker.createPsbt` call by `build_psbt_from_spec`.
+    Prefer this over a `psbt_mutator` for anything that is really about the
+    *shape* of the transaction (which inputs are external, the amounts, which
+    output is change). Keep at least one internal input so the device signs.
+
+    `fee` is the exact fee in satoshis. Because a transaction must balance
+    (inputs = outputs + fee), you control the fee by leaving one output's
+    `amount` unset (the "remainder"): it becomes `total_in - explicit - fee`.
+    So a large `fee` with a small remainder gives a high-fee transaction, and a
+    small `fee` with a change remainder gives a net receive. If every output has
+    an explicit amount there is no free variable, so `fee` must equal
+    `total_in - sum(outputs)` exactly (else it's a mistake and we raise).
+
+    All of that assumes the transaction is complete, which holds only as long as
+    every input commits to all the amounts — i.e. uses SIGHASH_DEFAULT or
+    SIGHASH_ALL (or omits the field). If there are other sighash flags, every
+    output must set `amount` explicitly, and `fee` is ignored.
+    """
+    inputs: List[PsbtInputSpec]
+    outputs: List[PsbtOutputSpec]
+    fee: int = 1000
+
+
+def build_psbt_from_spec(policy, spec: PsbtSpec) -> PSBT:
+    """Build a fake PSBT for `policy` matching `spec`, via the shared factory.
+
+    At most one output may leave `amount` unset ("remainder"): it receives
+    `total_in - sum(explicit outputs) - spec.fee`. All other amounts are taken
+    verbatim. `spec.fee` is always honored — via the remainder if there is one,
+    otherwise as a checked invariant against `total_in - sum(outputs)`. A
+    per-input `sighash` is copied onto the built PSBT input.
+
+    Exception: if any input sets a `sighash` that doesn't commit to all the
+    amounts, the transaction is not required to balance (see `PsbtSpec`), so every
+    output must set `amount`, and `spec.fee` is neither used nor checked — outputs
+    may exceed the inputs.
+    """
+    # local imports (heavy module)
+    from test_utils.txmaker import createPsbt, sighash_commits_to_all_amounts
+
+    input_amounts = [i.amount for i in spec.inputs]
+    input_is_external = [i.external for i in spec.inputs]
+    input_sighashes = [i.sighash for i in spec.inputs]
+    total_in = sum(input_amounts)
+
+    # SIGHASH_DEFAULT / SIGHASH_ALL still fix every amount, so they keep the
+    # ordinary balanced treatment, exactly like an unset sighash.
+    unbalanced = not all(
+        sighash_commits_to_all_amounts(sighash) for sighash in input_sighashes
+    )
+
+    remainder_indices = [n for n, o in enumerate(spec.outputs) if o.amount is None]
+    if len(remainder_indices) > 1:
+        raise ValueError("at most one output may omit `amount` (the remainder)")
+    explicit_total = sum(o.amount for o in spec.outputs if o.amount is not None)
+
+    if unbalanced:
+        if spec.fee != 0:
+            raise ValueError("fee must be 0 (or omitted) when a sighash doesn't commit to all amounts")
+
+        # No fee to spread around: such a sighash leaves the transaction open, so
+        # there is nothing for a remainder output to absorb.
+        if remainder_indices:
+            raise ValueError(
+                "every output must set `amount` when an input sets a `sighash` "
+                "that doesn't commit to all the amounts: such a transaction need "
+                "not balance, so there is no fee for a remainder output to absorb"
+            )
+        output_amounts = [o.amount for o in spec.outputs]
+    elif remainder_indices:
+        remainder = total_in - explicit_total - spec.fee
+        if remainder < 0:
+            raise ValueError(
+                f"remainder is negative: inputs ({total_in}) too small for "
+                f"explicit outputs ({explicit_total}) + fee ({spec.fee})"
+            )
+        output_amounts = [
+            remainder if o.amount is None else o.amount for o in spec.outputs
+        ]
+    else:
+        # No free variable: the fee is fully determined by inputs - outputs, so
+        # the declared fee must match (guards against a silently-ignored fee).
+        implied_fee = total_in - explicit_total
+        if implied_fee < 0:
+            raise ValueError(
+                f"outputs ({explicit_total}) exceed inputs ({total_in})"
+            )
+        if spec.fee != implied_fee:
+            raise ValueError(
+                f"fee={spec.fee} disagrees with inputs - outputs ({implied_fee}); "
+                f"leave one output's amount unset (the remainder) to let the fee "
+                f"take effect, or set fee={implied_fee}"
+            )
+        output_amounts = [o.amount for o in spec.outputs]
+    output_is_change = [o.is_change for o in spec.outputs]
+
+    return createPsbt(
+        policy, input_amounts, output_amounts, output_is_change, input_is_external,
+        input_sighashes,
+    )
+
+
 # ----- wallet-policy presets -------------------------------------------------
 
 @dataclass
@@ -128,8 +266,11 @@ class PolicyPreset:
     wallet_name: str               # WalletPolicy.name; "" => standard, no registration
     template: str
     keys: List[KeySpec]
-    # sign-psbt only: optional mutator applied to the generated fake PSBT.
-    # Ignored on the register-wallet and get-address tabs.
+    # sign-psbt only; both are ignored on the register-wallet / get-address tabs.
+    # `psbt_spec` declaratively describes the fake PSBT to generate (preferred).
+    # `psbt_mutator` is an escape hatch that tweaks the generated PSBT after the
+    # fact; when both are set, the spec builds it and the mutator tweaks it.
+    psbt_spec: Optional[PsbtSpec] = None
     psbt_mutator: Optional[Callable[[PSBT], PSBT]] = None
 
     @property
@@ -205,6 +346,23 @@ POLICY_PRESETS: List[PolicyPreset] = [
         ],
     ),
 
+    PolicyPreset(
+        name="tr-miniscript-3key",
+        description=(
+            "Taproot miniscript: internal keypath"
+            " + external single-key"
+            " + external timelocked single-sig"
+        ),
+        wallet_name="TR miniscript 3key",
+        template="tr(@0/**,{pk(@1/**),and_v(v:pk(@2/<0;1>/*),older(52560))})",
+        keys=[
+            KeySpec("m/86'/1'/0'"),                    # device: key-path spend
+            KeySpec("m/86'/1'/0'", external_index=0),  # ext1: immediate script-path
+            KeySpec("m/86'/1'/0'", external_index=1),  # ext2: timelock script-path
+        ],
+    ),
+
+
     # --- musig2 -------------------------------------------------------------
     PolicyPreset(
         name="musig2-keypath",
@@ -219,34 +377,127 @@ POLICY_PRESETS: List[PolicyPreset] = [
 ]
 
 
-# ----- sign-psbt PSBT mutators ----------------------------------------------
+# ----- sign-psbt scenario presets -------------------------------------------
 
-def _huge_fee_mutator(psbt: PSBT) -> PSBT:
-    """Reduce every output value to dust so that almost the entire input
-    value becomes fee — exercises the device's high-fee warning UX."""
-    DUST = 1000
-    for vout in psbt.tx.vout:
-        vout.nValue = DUST
-    return psbt
-
-
-# Sign-psbt-only scenario presets. These reuse simple wallet policies but
-# mutate the generated fake PSBT to put the device in an interesting state.
+# These reuse simple wallet policies but shape the generated fake PSBT (via a
+# declarative `psbt_spec`) to put the device in an interesting state. The
+# `psbt_mutator` escape hatch on `PolicyPreset` is available for tweaks a spec
+# can't express, but no preset currently needs it.
 SIGN_PSBT_SCENARIO_PRESETS: List[PolicyPreset] = [
     PolicyPreset(
         name="huge-fee-wpkh",
-        description="wpkh single-sig with all outputs forced to dust — should trigger the high-fee warning",
+        description="wpkh single-sig paying almost the entire input as fee — should trigger the high-fee warning",
         wallet_name="",
         template="wpkh(@0/**)",
         keys=[KeySpec("m/84'/1'/0'")],
-        psbt_mutator=_huge_fee_mutator,
+        psbt_spec=PsbtSpec(
+            inputs=[PsbtInputSpec(100_000_000)],
+            # The remainder recipient gets total_in - fee = 1000 (dust); the
+            # ~1 BTC fee dwarfs it -> high-fee warning.
+            outputs=[PsbtOutputSpec()],
+            fee=99_999_000,
+        ),
+    ),
+    PolicyPreset(
+        name="external-inputs-net-send",
+        description=(
+            "tr single-sig with a large external input, most value sent out — "
+            "external-inputs warning + net-send display"
+        ),
+        wallet_name="",
+        template="tr(@0/**)",
+        keys=[KeySpec("m/86'/1'/0'")],
+        psbt_spec=PsbtSpec(
+            inputs=[
+                PsbtInputSpec(100_000_000),                 # internal (the wallet signs this)
+                PsbtInputSpec(300_000_000, external=True),  # external (foreign, unsigned)
+            ],
+            outputs=[
+                PsbtOutputSpec(),                             # recipient absorbs the rest
+                # change < internal inputs (100M) => net send
+                PsbtOutputSpec(amount=50_000_000, is_change=True),
+            ],
+        ),
+    ),
+    PolicyPreset(
+        name="external-inputs-net-receive",
+        description=(
+            "tr single-sig with a large external input routed to change — "
+            "external-inputs warning + net-receive display"
+        ),
+        wallet_name="",
+        template="tr(@0/**)",
+        keys=[KeySpec("m/86'/1'/0'")],
+        psbt_spec=PsbtSpec(
+            inputs=[
+                PsbtInputSpec(100_000_000),                 # internal (the wallet signs this)
+                PsbtInputSpec(300_000_000, external=True),  # external (foreign, unsigned)
+            ],
+            outputs=[
+                PsbtOutputSpec(amount=10_000),   # small recipient
+                PsbtOutputSpec(is_change=True),  # change absorbs the rest => net receive
+            ],
+        ),
+    ),
+
+    # --- non-default sighash types (need the device's non-standard-sighash setting) ---
+    PolicyPreset(
+        name="sighash-anyonecanpay",
+        description=(
+            "wpkh single-sig, every input with ALL | ANYONECANPAY"
+        ),
+        wallet_name="",
+        template="wpkh(@0/**)",
+        keys=[KeySpec("m/84'/1'/0'")],
+        psbt_spec=PsbtSpec(
+            inputs=[
+                PsbtInputSpec(100_000_000, sighash=SIGHASH_ALL | SIGHASH_ANYONECANPAY),
+                PsbtInputSpec(50_000_000, sighash=SIGHASH_ALL | SIGHASH_ANYONECANPAY),
+            ],
+            outputs=[
+                PsbtOutputSpec(amount=120_000_000),              # recipient
+                PsbtOutputSpec(amount=80_999_000, is_change=True),  # change
+            ],
+        ),
+    ),
+    PolicyPreset(
+        name="sighash-none",
+        description=("wpkh single-sig, every input with NONE (0x02)"),
+        wallet_name="",
+        template="wpkh(@0/**)",
+        keys=[KeySpec("m/84'/1'/0'")],
+        psbt_spec=PsbtSpec(
+            inputs=[
+                PsbtInputSpec(100_000_000, sighash=SIGHASH_NONE),
+                PsbtInputSpec(50_000_000, sighash=SIGHASH_NONE),
+            ],
+            outputs=[
+                PsbtOutputSpec(amount=120_000_000),              # recipient
+                PsbtOutputSpec(amount=80_999_000, is_change=True),  # change
+            ],
+        ),
+    ),
+    PolicyPreset(
+        name="sighash-single-anyonecanpay-1in1out",
+        description=("wpkh single-sig, 1-in-1-out, SINGLE|ANYONECANPAY"),
+        wallet_name="",
+        template="wpkh(@0/**)",
+        keys=[KeySpec("m/84'/1'/0'")],
+        psbt_spec=PsbtSpec(
+            inputs=[
+                PsbtInputSpec(100_000_000, sighash=SIGHASH_SINGLE | SIGHASH_ANYONECANPAY),
+            ],
+            outputs=[
+                PsbtOutputSpec(amount=120_000_000, is_change=True),
+            ],
+        ),
     ),
 ]
 
 
 def sign_psbt_presets() -> List[PolicyPreset]:
-    """Presets shown on the sign-psbt tab: every wallet-policy preset (no
-    mutator) plus the scenario presets (with mutators)."""
+    """Presets shown on the sign-psbt tab: every wallet-policy preset plus the
+    scenario presets."""
     return list(POLICY_PRESETS) + list(SIGN_PSBT_SCENARIO_PRESETS)
 
 

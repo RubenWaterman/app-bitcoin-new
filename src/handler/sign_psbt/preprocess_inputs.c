@@ -33,11 +33,11 @@
 #include "dispatcher.h"
 #include "error_codes.h"
 #include "get_merkleized_map.h"
-#include "get_merkleized_map_value.h"
 #include "init_global_state.h"
 #include "policy.h"
 #include "process_in_outs.h"
 #include "psbt.h"
+#include "psbt_fields.h"
 #include "sighash.h"
 #include "sign_psbt_cache.h"
 #include "sw.h"
@@ -154,6 +154,33 @@ bool __attribute__((noinline)) preprocess_inputs(
             return false;
         }
 
+        // BIP-322 proof of funds: "the Non-Witness UTXO field may be omitted for any input that
+        // spends an output from the same transaction as an input earlier in the list". Such an
+        // input is authenticated with the non-witness utxo carried by that earlier input, exactly
+        // as if it were its own (see get_amount_scriptpubkey_from_psbt_nonwitness_shared).
+        bool nonwitness_shared = false;
+        if (!input.has_nonWitnessUtxo && st->bip322.is_message_signing && cur_input_index > 0) {
+            if (0 ==
+                get_amount_scriptpubkey_from_psbt_nonwitness_shared(dc,
+                                                                    st,
+                                                                    cur_input_index,
+                                                                    &input.in_out.map,
+                                                                    &input.prevout_amount,
+                                                                    input.in_out.scriptPubKey,
+                                                                    &input.in_out.scriptPubKey_len,
+                                                                    NULL)) {
+                // sanity check before accumulating, to avoid overflowing the total
+                if (input.prevout_amount > BITCOIN_TOTAL_SUPPLY) {
+                    PRINTF("Input amount exceeds Bitcoin total supply!\n");
+                    SEND_SW(dc, SW_INCORRECT_DATA);
+                    return false;
+                }
+                st->inputs_total_amount += input.prevout_amount;
+                input.has_nonWitnessUtxo = true;
+                nonwitness_shared = true;
+            }
+        }
+
         // either witness utxo or non-witness utxo (or both) must be present.
         if (!input.has_nonWitnessUtxo && !input.has_witnessUtxo) {
             PRINTF("No witness utxo nor non-witness utxo present in input.\n");
@@ -163,17 +190,13 @@ bool __attribute__((noinline)) preprocess_inputs(
 
         // validate non-witness utxo (if present) and witness utxo (if present)
 
-        if (input.has_nonWitnessUtxo) {
+        if (input.has_nonWitnessUtxo && !nonwitness_shared) {
             uint8_t prevout_hash[32];
 
             // check if the prevout_hash of the transaction matches the computed one from the
             // non-witness utxo
-            if (0 > call_get_merkleized_map_value(dc,
-                                                  &input.in_out.map,
-                                                  (uint8_t[]) {PSBT_IN_PREVIOUS_TXID},
-                                                  1,
-                                                  prevout_hash,
-                                                  sizeof(prevout_hash))) {
+            if (PSBT_FIELD_PRESENT !=
+                psbt_get_input_prevout_txid(dc, &input.in_out.map, prevout_hash)) {
                 SEND_SW(dc, SW_INCORRECT_DATA);
                 return false;
             }
@@ -190,6 +213,12 @@ bool __attribute__((noinline)) preprocess_inputs(
                 return false;
             }
 
+            // sanity check before accumulating, to avoid overflowing the total
+            if (input.prevout_amount > BITCOIN_TOTAL_SUPPLY) {
+                PRINTF("Input amount exceeds Bitcoin total supply!\n");
+                SEND_SW(dc, SW_INCORRECT_DATA);
+                return false;
+            }
             st->inputs_total_amount += input.prevout_amount;
         }
 
@@ -224,19 +253,18 @@ bool __attribute__((noinline)) preprocess_inputs(
                 }
             } else {
                 // we extract the scriptPubKey and prevout amount from the witness utxo
+                // sanity check before accumulating, to avoid overflowing the total
+                if (wit_utxo_prevout_amount > BITCOIN_TOTAL_SUPPLY) {
+                    PRINTF("Input amount exceeds Bitcoin total supply!\n");
+                    SEND_SW(dc, SW_INCORRECT_DATA);
+                    return false;
+                }
                 st->inputs_total_amount += wit_utxo_prevout_amount;
 
                 input.prevout_amount = wit_utxo_prevout_amount;
                 input.in_out.scriptPubKey_len = wit_utxo_scriptPubkey_len;
                 memcpy(input.in_out.scriptPubKey, wit_utxo_scriptPubkey, wit_utxo_scriptPubkey_len);
             }
-        }
-
-        if (input.prevout_amount > BITCOIN_TOTAL_SUPPLY) {
-            // sanity check to avoid overflows in amounts
-            PRINTF("Input amount exceed Bitcoin total supply!\n");
-            SEND_SW(dc, SW_INCORRECT_DATA);
-            return false;
         }
 
         // check if the input is internal; if not, continue
@@ -249,6 +277,12 @@ bool __attribute__((noinline)) preprocess_inputs(
         } else if (is_internal == 0) {
             ++st->n_external_inputs;
             st->warnings.external_inputs = true;
+            if (!input.has_nonWitnessUtxo) {
+                // The amount comes only from the (unverified) witness-utxo, not hash-verified
+                // against the prevout txid. Trustworthy only if we sign taproot inputs (which
+                // commit sha_amounts over all inputs).
+                st->external_amount_unverified = true;
+            }
             PRINTF("INPUT %d is external\n", cur_input_index);
             continue;
         }
@@ -295,11 +329,8 @@ bool __attribute__((noinline)) preprocess_inputs(
         }
 
         // get the sighash_type
-        if (4 != call_get_merkleized_map_value_u32_le(dc,
-                                                      &input.in_out.map,
-                                                      (uint8_t[]) {PSBT_IN_SIGHASH_TYPE},
-                                                      1,
-                                                      &input.sighash_type)) {
+        if (PSBT_FIELD_PRESENT !=
+            psbt_get_input_sighash_type(dc, &input.in_out.map, &input.sighash_type)) {
             PRINTF("Malformed PSBT_IN_SIGHASH_TYPE for input %d\n", cur_input_index);
 
             SEND_SW(dc, SW_INCORRECT_DATA);

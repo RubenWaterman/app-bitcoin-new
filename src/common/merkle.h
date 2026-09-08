@@ -1,6 +1,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 // TODO: RFC6962 defines the empty list hash as sha256(b''); while we're using 0 here. Should we
@@ -61,7 +62,7 @@ void merkle_combine_hashes(const uint8_t left[static 32],
 static inline uint8_t ceil_lg(uint32_t n) {
     uint8_t r = 0;
     uint32_t t = 1;
-    while (t < n) {
+    while (t < n && r < 32) {
         t = 2 * t;
         ++r;
     }
@@ -69,7 +70,12 @@ static inline uint8_t ceil_lg(uint32_t n) {
 }
 
 // Returns the ith member of the directions array for the leaf with the given index in a Merkle tree
-// of the given size. Returns -1 on error.
+// of the given size, where 0 = left and 1 = right. Returns -1 on error.
+//
+// A non-negative direction is returned exactly for the indexes i that are within the path from the
+// root to the leaf, that is, for i < depth of the leaf; -1 is returned for any larger i (and if
+// size or index are out of range). Therefore, this can also be used to compute the depth of a leaf,
+// or to check that it equals a given value.
 int merkle_get_ith_direction(size_t size, size_t index, size_t i);
 
 /**
@@ -81,4 +87,11 @@ typedef struct {
     uint64_t size;
     uint8_t keys_root[32];
     uint8_t values_root[32];
+
+    // PRIVATE - managed only by the merkleized-map API (call_get_merkleized_map* /
+    // call_check_merkleized_map_sorted). Set to true once the keys tree has been verified to be
+    // lexicographically sorted (and therefore the keys are unique), which is the precondition for
+    // reading a value by key. The by-key readers assert this is set.
+    // Callers must not read or set it directly.
+    bool _keys_are_sorted;
 } merkleized_map_commitment_t;

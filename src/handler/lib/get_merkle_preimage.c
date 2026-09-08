@@ -11,10 +11,11 @@
 #include "debug.h"
 #include "sw.h"
 
-int call_get_merkle_preimage(dispatcher_context_t *dispatcher_context,
-                             const uint8_t hash[static 32],
-                             uint8_t *out_ptr,
-                             size_t out_ptr_len) {
+// Body of call_get_merkle_preimage; the wrapper below clears `out_ptr` on failure.
+static int get_merkle_preimage(dispatcher_context_t *dispatcher_context,
+                               const uint8_t hash[static 32],
+                               uint8_t *out_ptr,
+                               size_t out_ptr_len) {
     // LOG_PROCESSOR(__FILE__, __LINE__, __func__);
 
     PRINT_STACK_POINTER();
@@ -57,6 +58,12 @@ int call_get_merkle_preimage(dispatcher_context_t *dispatcher_context,
 
     uint8_t *data_ptr =
         dispatcher_context->read_buffer.ptr + dispatcher_context->read_buffer.offset;
+
+    // Merkle tree leaves are hashes of 0x00 || element
+    if (data_ptr[0] != 0x00) {
+        PRINTF("Not a Merkle tree leaf preimage\n");
+        return -12;
+    }
 
     cx_sha256_t hash_context;
 
@@ -123,4 +130,16 @@ int call_get_merkle_preimage(dispatcher_context_t *dispatcher_context,
     }
 
     return (int) (preimage_len - 1);
+}
+
+int call_get_merkle_preimage(dispatcher_context_t *dispatcher_context,
+                             const uint8_t hash[static 32],
+                             uint8_t *out_ptr,
+                             size_t out_ptr_len) {
+    int res = get_merkle_preimage(dispatcher_context, hash, out_ptr, out_ptr_len);
+    if (res < 0) {
+        // The preimage is streamed in before its hash can be checked; see call_get_preimage.
+        explicit_bzero(out_ptr, out_ptr_len);
+    }
+    return res;
 }

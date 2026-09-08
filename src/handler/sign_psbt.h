@@ -34,7 +34,7 @@ typedef struct {
                                 // matched with the current key expression in the signing flow
 
     bool is_change;
-    int address_index;
+    uint32_t address_index;
 
     // For an output, its scriptPubKey
     // for an input, the prevout's scriptPubKey (either from the non-witness-utxo, or from the
@@ -105,6 +105,22 @@ typedef struct {
     uint8_t tapleaf_hash[32];
 } keyexpr_info_t;
 
+// State for BIP-322 message signing, used when the PSBT_GLOBAL_GENERIC_SIGNED_MESSAGE field
+// is present in the PSBT. The message itself is never stored: it is streamed once at detection
+// time to compute the hashes below, and streamed again into the UI buffer just before the
+// review screen (both passes are authenticated by the same Merkle commitment).
+typedef struct {
+    bool is_message_signing;  // true iff PSBT_GLOBAL_GENERIC_SIGNED_MESSAGE is present
+    bool message_printable;   // short enough and printable ASCII => shown in full
+    uint64_t message_length;
+    uint8_t message_hash[32];    // BIP0322-signed-message tagged hash of the message
+    uint8_t message_sha256[32];  // plain sha256(message), shown when not printable
+    // the scriptPubKey whose ownership is being proven (BIP-322's message_challenge);
+    // copied at validation time as it is needed again to show the address at display time
+    uint8_t challenge_script[MAX_PREVOUT_SCRIPTPUBKEY_LEN];
+    size_t challenge_script_len;
+} bip322_state_t;
+
 // Cache for partial hashes during signing (avoid quadratic hashing for segwit transactions)
 typedef struct tx_hashes_s {
     uint8_t sha_prevouts[32];
@@ -169,6 +185,12 @@ typedef struct {
     bool sighash_inputs_open;
     bool sighash_outputs_open;
 
+    // Set if some external input's amount is not verified by recomputing the txid (only a
+    // witness-utxo is provided, never validated against the prevout txid).
+    // Unless the internal inputs we sign are taproot inputs (which commit sha_amounts which
+    // includes all amounts), external amounts can't be trusted, nor can the fee.
+    bool external_amount_unverified;
+
     // Common sighash seen across the inputs we sign (DEFAULT canonicalized to ALL); valid if
     // !sighash_mixed.
     uint32_t seen_sighash;
@@ -194,5 +216,8 @@ typedef struct {
     account_ctx_t account;
 
     tx_ux_warning_t warnings;
+
+    // BIP-322 message signing state; bip322.is_message_signing is false for normal transactions.
+    bip322_state_t bip322;
 
 } sign_psbt_state_t;

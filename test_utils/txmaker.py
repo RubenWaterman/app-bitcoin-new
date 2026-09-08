@@ -29,7 +29,7 @@ from embit.descriptor import Descriptor
 from embit.networks import NETWORKS
 from embit.script import Script
 
-from bitcoin_client.ledger_bitcoin.embit.descriptor.miniscript import Miniscript
+from bitcoin_client.ledger_bitcoin._embit.descriptor.miniscript import Miniscript
 from test_utils import bip0340, sha256, hash160
 from test_utils.bip0327 import cbytes, key_agg
 from test_utils.wallet_policy import DescriptorTemplate, KeyPlaceholder, MuSig2KeyPlaceholder, PlainKeyPlaceholder, ShDescriptorTemplate, ShWpkhDescriptorTemplate, ShWshDescriptorTemplate, TrDescriptorTemplate, WshDescriptorTemplate, WpkhDescriptorTemplate, PkhDescriptorTemplate, derive_plain_descriptor, tapleaf_hash
@@ -397,19 +397,70 @@ def fill_inout(wallet_policy: WalletPolicy, inout: Union[PartiallySignedInput, P
                 derived_key_origin = KeyOriginInfo(fpr, placeholder_der_subpath)
                 inout.hd_keypaths[derived_pubkey.pubkey] = derived_key_origin
 
-def createPsbt(wallet_policy: WalletPolicy, input_amounts: List[int], output_amounts: List[int], output_is_change: List[bool]) -> PSBT:
+# Sighash types that commit to every input and output: SIGHASH_DEFAULT (0x00,
+# taproot only) and SIGHASH_ALL (0x01).
+_SIGHASH_TYPES_COMMITTING_TO_ALL = (0x00, 0x01)
+
+
+def sighash_commits_to_all_amounts(sighash: Optional[int]) -> bool:
+    """True if `sighash` fixes both the input and the output set, so that a
+    transaction signed with it must balance. `None` means PSBT_IN_SIGHASH_TYPE is
+    omitted, i.e. the default, which does. Everything else (NONE or SINGLE, which
+    leave outputs open, and any type with ANYONECANPAY OR-ed on top, which leaves
+    the inputs open) does not."""
+    return sighash is None or sighash in _SIGHASH_TYPES_COMMITTING_TO_ALL
+
+
+def createPsbt(wallet_policy: WalletPolicy, input_amounts: List[int], output_amounts: List[int], output_is_change: List[bool], input_is_external: Optional[List[bool]] = None, input_sighashes: Optional[List[Optional[int]]] = None) -> PSBT:
     assert len(output_amounts) == len(output_is_change)
-    assert sum(output_amounts) <= sum(input_amounts)
+
+    # input_is_external marks inputs the wallet policy does NOT own: they get a
+    # foreign prevout and no key-derivation info, so the app treats them as
+    # external. Defaults to all-internal (the historical behavior).
+    if input_is_external is None:
+        input_is_external = [False] * len(input_amounts)
+    assert len(input_is_external) == len(input_amounts)
+
+    # input_sighashes[i] is the PSBT_IN_SIGHASH_TYPE of input i; None means the
+    # field is omitted, i.e. the default sighash. Defaults to all-default.
+    if input_sighashes is None:
+        input_sighashes = [None] * len(input_amounts)
+    assert len(input_sighashes) == len(input_amounts)
+
+    # A complete transaction cannot spend more than it receives. A sighash that
+    # doesn't commit to all the amounts leaves the transaction open — under
+    # ANYONECANPAY the missing value comes from inputs another signer adds — so it
+    # need not balance, and the check doesn't apply.
+    if all(sighash_commits_to_all_amounts(sighash) for sighash in input_sighashes):
+        assert sum(output_amounts) <= sum(input_amounts)
 
     vin: List[CTxIn] = [CTxIn() for _ in input_amounts]
     vout: List[CTxOut] = [CTxOut() for _ in output_amounts]
 
-    # create some credible prevout transactions
-    prevouts: List[CTransaction] = []
+    # create some credible prevout transactions. For external inputs there is
+    # no wallet-derived prevout: external_utxos[i] holds a synthetic foreign
+    # witness UTXO, and the internal-only parallel lists get None placeholders
+    # to stay index-aligned.
+    prevouts: List[Optional[CTransaction]] = []
     prevout_ns: List[int] = []
     prevout_path_change: List[int] = []
     prevout_path_addr_idx: List[int] = []
+    external_utxos: List[Optional[CTxOut]] = []
     for i, prevout_amount in enumerate(input_amounts):
+        if input_is_external[i]:
+            # A P2WPKH to a random key: a valid, standard scriptPubKey that
+            # does not derive from the wallet policy.
+            external_utxos.append(CTxOut(prevout_amount, b"\x00\x14" + random_bytes(20)))
+            prevouts.append(None)
+            prevout_ns.append(0)
+            prevout_path_change.append(0)
+            prevout_path_addr_idx.append(0)
+
+            vin[i].prevout = COutPoint(uint256_from_str(random_txid()), 0)
+            vin[i].scriptSig = b''
+            vin[i].nSequence = 0
+            continue
+
         n_inputs = randint(1, 10)
         n_outputs = randint(1, 10)
         prevout, idx, is_change, addr_idx = createFakeWalletTransaction(
@@ -418,6 +469,7 @@ def createPsbt(wallet_policy: WalletPolicy, input_amounts: List[int], output_amo
         prevout_ns.append(idx)
         prevout_path_change.append(is_change)
         prevout_path_addr_idx.append(addr_idx)
+        external_utxos.append(None)
 
         vin[i].prevout = COutPoint(prevout.sha256, idx)
         vin[i].scriptSig = b''
@@ -465,6 +517,15 @@ def createPsbt(wallet_policy: WalletPolicy, input_amounts: List[int], output_amo
         wallet_policy.descriptor_template)
 
     for input_index, input in enumerate(psbt.inputs):
+        if input_sighashes[input_index] is not None:
+            input.sighash = input_sighashes[input_index]
+
+        if input_is_external[input_index]:
+            # External input: only the (foreign) witness UTXO, so its amount is
+            # known, but deliberately no derivation info => seen as external.
+            input.witness_utxo = external_utxos[input_index]
+            continue
+
         if desc_tmpl.is_segwit():
             # add witness UTXO
             input.witness_utxo = prevouts[input_index].vout[prevout_ns[input_index]]

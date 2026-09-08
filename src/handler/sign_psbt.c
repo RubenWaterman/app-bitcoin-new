@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include "sign_psbt.h"
+#include "sign_psbt/bip322.h"
 #include "sign_psbt/init_global_state.h"
 #include "sign_psbt/preprocess_inputs.h"
 #include "sign_psbt/preprocess_outputs.h"
@@ -34,19 +35,13 @@
 #include "constants.h"
 #include "display.h"
 #include "dispatcher.h"
+#include "error_codes.h"
 #include "handle_swap_sign_transaction.h"
 #include "musig_sessions.h"
 #include "sign_psbt_cache.h"
 #include "swap_globals.h"
 #include "sw.h"
 #include "txhashes.h"
-
-// We declare this in the global space in order to use less stack space, since BOLOS enforces on
-// some devices an 8kb stack limit.
-// Once this is resolved in BOLOS, we should move this to the function scope to avoid unnecessarily
-// reserving RAM that can only be used for the signing flow (which, at time of writing, is the most
-// RAM-intensive operation command of the app).
-sign_psbt_cache_t G_sign_psbt_cache;
 
 void handler_sign_psbt(dispatcher_context_t *dc, uint8_t protocol_version) {
     LOG_PROCESSOR(__FILE__, __LINE__, __func__);
@@ -62,8 +57,16 @@ void handler_sign_psbt(dispatcher_context_t *dc, uint8_t protocol_version) {
     // read APDU inputs, initialize global state and read global PSBT map
     if (!init_global_state(dc, &st)) return;
 
-    sign_psbt_cache_t *cache = &G_sign_psbt_cache;
-    init_sign_psbt_cache(cache);
+#ifdef HAVE_SWAP
+    if (G_called_from_swap && st.bip322.is_message_signing) {
+        PRINTF("BIP-322 message signing is not allowed during swap\n");
+        SEND_SW_EC(dc, SW_NOT_SUPPORTED, EC_SIGN_PSBT_BIP322_NOT_ALLOWED_IN_SWAP);
+        return;
+    }
+#endif /* HAVE_SWAP */
+
+    sign_psbt_cache_t cache;
+    init_sign_psbt_cache(&cache);
 
     // bitmap to keep track of which inputs are internal
     uint8_t internal_inputs[BITVECTOR_REAL_SIZE(MAX_N_INPUTS_CAN_SIGN)];
@@ -81,14 +84,21 @@ void handler_sign_psbt(dispatcher_context_t *dc, uint8_t protocol_version) {
      *  - detect internal inputs that should be signed, and if there are external inputs or unusual
      * sighashes
      */
-    if (!preprocess_inputs(dc, &st, cache, internal_inputs)) return;
+    if (!preprocess_inputs(dc, &st, &cache, internal_inputs)) return;
 
     /** OUTPUTS VERIFICATION FLOW
      *
      *  For each output, check if it's a change address.
      *  Check if it's an acceptable output.
      */
-    if (!preprocess_outputs(dc, &st, cache, internal_outputs)) return;
+    if (!preprocess_outputs(dc, &st, &cache, internal_outputs)) return;
+
+    /** BIP-322 STRUCTURAL VALIDATION
+     *
+     *  If the PSBT declares itself as a BIP-322 message signing request, enforce the exact
+     *  to_sign structure; the PSBT is never reviewed as a transaction once the field is present.
+     */
+    if (st.bip322.is_message_signing && !bip322_validate(dc, &st)) return;
 
     // check if we're only executing the MuSig2 Round 1
     bool only_signing_for_musig = true;
@@ -117,7 +127,7 @@ void handler_sign_psbt(dispatcher_context_t *dc, uint8_t protocol_version) {
         // pubnonces; this does not involve the private keys, therefore we can do it without user
         // confirmation
 
-        if (!produce_musig2_pubnonces(dc, &st, &signing_state, cache, internal_inputs)) {
+        if (!produce_musig2_pubnonces(dc, &st, &signing_state, &cache, internal_inputs)) {
             return;
         }
     }
@@ -137,11 +147,21 @@ void handler_sign_psbt(dispatcher_context_t *dc, uint8_t protocol_version) {
         } else
 #endif /* HAVE_SWAP */
         {
-            /** TRANSACTION CONFIRMATION
-             *
-             *  Display each non-change output, and transaction fees, and acquire user confirmation,
-             */
-            if (!display_transaction(dc, &st, internal_outputs)) return;
+            if (st.bip322.is_message_signing) {
+                /** BIP-322 MESSAGE CONFIRMATION
+                 *
+                 *  Review as a message signature (account, address, message), never as a
+                 *  transaction.
+                 */
+                if (!bip322_display_message(dc, &st)) return;
+            } else {
+                /** TRANSACTION CONFIRMATION
+                 *
+                 *  Display each non-change output, and transaction fees, and acquire user
+                 *  confirmation,
+                 */
+                if (!display_transaction(dc, &st, internal_outputs)) return;
+            }
         }
 
         // Signing always takes some time, so we rather not wait before showing the spinner
@@ -152,13 +172,17 @@ void handler_sign_psbt(dispatcher_context_t *dc, uint8_t protocol_version) {
          * For each internal key expression, and for each internal input, sign using the
          * appropriate algorithm.
          */
-        int sign_result = sign_transaction(dc, &st, cache, &signing_state, internal_inputs);
+        int sign_result = sign_transaction(dc, &st, &cache, &signing_state, internal_inputs);
 
 #ifdef HAVE_SWAP
         if (!G_called_from_swap)
 #endif /* HAVE_SWAP */
         {
-            ui_post_processing_confirm_transaction(dc, sign_result);
+            if (st.bip322.is_message_signing) {
+                ui_post_processing_confirm_message(dc, sign_result);
+            } else {
+                ui_post_processing_confirm_transaction(dc, sign_result);
+            }
         }
 
         if (!sign_result) {

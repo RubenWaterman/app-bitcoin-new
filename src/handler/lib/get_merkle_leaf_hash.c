@@ -13,15 +13,22 @@
 #include "merkle.h"
 #include "sw.h"
 
-// Reads the inputs and sends the GET_MERKLE_LEAF_PROOF request.
-int call_get_merkle_leaf_hash(dispatcher_context_t *dc,
-                              const uint8_t merkle_root[static 32],
-                              uint32_t tree_size,
-                              uint32_t leaf_index,
-                              uint8_t out[static 32]) {
+// Sends the GET_MERKLE_LEAF_PROOF request and verifies the reply. Body of
+// call_get_merkle_leaf_hash; the wrapper below clears `out` on failure.
+static int get_merkle_leaf_hash(dispatcher_context_t *dc,
+                                const uint8_t merkle_root[static 32],
+                                uint32_t tree_size,
+                                uint32_t leaf_index,
+                                uint8_t out[static 32]) {
     // LOG_PROCESSOR(__FILE__, __LINE__, __func__);
 
     PRINT_STACK_POINTER();
+
+    // make sure that tree size and leaf index are consistent
+    if (tree_size == 0 || leaf_index >= tree_size) {
+        PRINTF("Leaf index out of range.\n");
+        return -1;
+    }
 
     {  // make sure memory is deallocated as soon as possible
         uint8_t tmp[9];
@@ -51,6 +58,19 @@ int call_get_merkle_leaf_hash(dispatcher_context_t *dc,
         if (!buffer_read_bytes(&dc->read_buffer, cur_hash, 32) ||
             !buffer_read_u8(&dc->read_buffer, &proof_size) ||
             !buffer_read_u8(&dc->read_buffer, &n_proof_elements)) {
+            return -1;
+        }
+
+        // The proof length must be exactly the depth of the leaf in the tree
+        // Since the tree_size and leaf_index are validated, the first call to
+        // merkle_get_ith_direction returns -1 precisely if proof_size is not smaller than the
+        // correct proof size.
+        if (merkle_get_ith_direction(tree_size, leaf_index, proof_size) != -1 ||
+            (proof_size > 0 &&
+             merkle_get_ith_direction(tree_size, leaf_index, (size_t) proof_size - 1) < 0)) {
+            PRINTF("Merkle proof length does not match the depth of the leaf.\n");
+
+            // Wrong length of the Merkle proof.
             return -1;
         }
 
@@ -126,4 +146,17 @@ int call_get_merkle_leaf_hash(dispatcher_context_t *dc,
     }
 
     return 0;
+}
+
+int call_get_merkle_leaf_hash(dispatcher_context_t *dc,
+                              const uint8_t merkle_root[static 32],
+                              uint32_t tree_size,
+                              uint32_t leaf_index,
+                              uint8_t out[static 32]) {
+    int res = get_merkle_leaf_hash(dc, merkle_root, tree_size, leaf_index, out);
+    if (res < 0) {
+        // The leaf hash is copied out before the proof is verified; see call_get_preimage.
+        explicit_bzero(out, 32);
+    }
+    return res;
 }

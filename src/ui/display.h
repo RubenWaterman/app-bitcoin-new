@@ -79,6 +79,15 @@ typedef struct {
     char message[MAX_DISPLAYBLE_MESSAGE_LENGTH + 1];
 } ui_path_and_message_state_t;
 
+// State for the BIP-322 message review. The message field is filled directly by the caller
+// (streamed from the client) before ui_display_bip322_message_and_confirm is invoked.
+typedef struct {
+    char account[MAX_WALLET_NAME_LENGTH + 1];
+    char address[MAX_ADDRESS_LENGTH_STR + 1];
+    char proven_amount[MAX_AMOUNT_LENGTH + 1];  // total of the proof-of-funds inputs
+    char message[MAX_DISPLAYBLE_MESSAGE_LENGTH + 1];
+} ui_bip322_message_state_t;
+
 typedef struct {
     char wallet_name[MAX_WALLET_NAME_LENGTH + 1];
 
@@ -124,9 +133,21 @@ typedef enum {
 typedef struct {
     tx_display_mode_t mode;
     uint64_t fee;           // for TX_DISPLAY_FULL
-    int64_t total_spent;    // for TX_DISPLAY_NET_ONLY (negative = net receive)
+    int64_t total_spent;    // net amount leaving the account (negative = net receive); used for
+                            // TX_DISPLAY_NET_ONLY and, in FULL mode, when there are external inputs
     uint32_t seen_sighash;  // effective sighash, for the "Signing rule" row
     bool sighash_mixed;     // signed inputs disagree -> shown as "Mixed"
+
+    // With external (unverified) inputs, the outputs and fee alone don't tell the user how much
+    // really leaves (or enters) their wallet, so we additionally show the net amount actually
+    // spent/received (has_external_inputs, FULL mode) and the total amount of the external inputs.
+    bool has_external_inputs;
+    // Whether to show the "External inputs amount" row: only when there are external inputs
+    // *and* the input set is closed (no ANYONECANPAY), so their total is fixed after signing.
+    // This is trustworthy independently of the output/fee display mode, hence shown in both FULL
+    // and NET_ONLY.
+    bool show_external_inputs_amount;
+    uint64_t external_inputs_amount;  // total amount of the external inputs
 } tx_summary_t;
 
 typedef struct {
@@ -142,10 +163,14 @@ typedef struct {
     char amount[MAX_EXT_OUTPUT_SIMPLIFIED_NUMBER][MAX_AMOUNT_LENGTH + 1];
     char fee[MAX_AMOUNT_LENGTH + 1];         // formatted network fee (FULL only)
     char net_amount[MAX_AMOUNT_LENGTH + 1];  // formatted |total_spent|, the "You spend/receive"
-                                             // value (NET_ONLY only)
+                                             // value (NET_ONLY, or FULL with external inputs)
+
+    char unverified_inputs[MAX_AMOUNT_LENGTH + 1];  // formatted external_inputs_amount
+    bool has_external_inputs;                       // net "You spend/receive" row in FULL mode
+    bool show_external_inputs_amount;  // "External inputs amount" row (FULL and NET_ONLY)
 
     tx_display_mode_t display_mode;
-    bool spent_is_receive;        // for TX_DISPLAY_NET_ONLY: total_spent < 0
+    bool spent_is_receive;        // for NET_ONLY, or FULL with external inputs: total_spent < 0
     account_role_t account_role;  // From / To / unknown for the account row
     bool account_is_default;      // default derivation vs registered policy, for the row label
     uint32_t seen_sighash;        // for the "Signing rule" row
@@ -159,6 +184,7 @@ typedef union {
     ui_path_and_pubkey_state_t path_and_pubkey;
     ui_path_and_address_state_t path_and_address;
     ui_path_and_message_state_t path_and_message;
+    ui_bip322_message_state_t bip322_message;
     ui_wallet_state_t wallet;
     ui_cosigner_pubkey_and_index_state_t cosigner_pubkey_and_index;
     ui_register_wallet_policy_state_t register_wallet_policy;
@@ -185,6 +211,20 @@ bool ui_display_message_and_confirm(dispatcher_context_t *context,
                                     const char *message,
                                     bool is_hash);
 
+/**
+ * Shows the BIP-322 message review and asks for confirmation to sign.
+ * The message (or its hash) must already be in g_ui_state.bip322_message.message; account
+ * (NULL to hide the row) and address are copied into the UI state by this function.
+ * If has_proven_funds is true, a "Proving funds" row with the formatted proven_amount is
+ * shown (proof-of-funds variant).
+ */
+bool ui_display_bip322_message_and_confirm(dispatcher_context_t *context,
+                                           const char *account,
+                                           const char *address,
+                                           bool is_hash,
+                                           bool has_proven_funds,
+                                           uint64_t proven_amount);
+
 // Reviews a wallet policy to register. Pass `descriptor_template == NULL` to
 // hide the raw descriptor template (when the cleartext lines already fully
 // capture the policy); otherwise it is shown after the cleartext block.
@@ -201,8 +241,6 @@ bool ui_display_wallet_address(dispatcher_context_t *context,
                                const char *wallet_name,
                                const char *address);
 
-bool ui_display_unusual_path(dispatcher_context_t *context, const char *bip32_path_str);
-
 void ui_prepare_authorize_wallet_spend(const char *wallet_name,
                                        account_role_t account_role,
                                        bool account_is_default,
@@ -217,12 +255,12 @@ bool ui_warn_nondefault_sighash(dispatcher_context_t *context);
 // Shows a terminal status explaining that a non-standard sighash was rejected
 void ui_warn_nondefault_sighash_disabled(dispatcher_context_t *context);
 
-bool ui_warn_high_fee(dispatcher_context_t *context);
-
 /* These 3 functions have to be called in following order:
  * 1. init - initialize the flow; the summary is applied here so the account row, the
  *           "Signing rule" line and the per-output page breaks are all available up front.
- * 2. add  - to add information for an output.
+ *           `outputs_num` must not exceed MAX_EXT_OUTPUT_SIMPLIFIED_NUMBER, the capacity of the
+ *           per-output arrays.
+ * 2. add  - to add information for an output; must be called at most `outputs_num` times.
  * 3. show - to actually start showing the transaction screens.
  * These functions call respectively init, add and show functions from display_nbgl module.
  */
@@ -254,11 +292,11 @@ void ui_display_pubkey_flow(void);
 
 void ui_sign_message_and_confirm_flow(bool is_hash);
 
+void ui_display_bip322_message_flow(bool has_account, bool is_hash, bool has_proven_funds);
+
 void ui_display_receive_in_wallet_flow(void);
 
 void ui_display_default_wallet_address_flow(void);
-
-void ui_display_spend_from_wallet_flow(void);
 
 void ui_display_warning_external_inputs_flow(void);
 
@@ -267,8 +305,6 @@ void ui_display_unverified_segwit_inputs_flows(void);
 void ui_display_nondefault_sighash_flow(void);
 
 void ui_display_nondefault_sighash_disabled_flow(void);
-
-void ui_warn_high_fee_flow(void);
 
 void ui_display_register_wallet_policy_flow(void);
 
@@ -280,20 +316,12 @@ void ui_display_transaction_streaming_prompt(void);
 void ui_display_transaction_streaming_output_address_amount(void);
 void ui_display_transaction_streaming_flow(bool is_self_transfer);
 
-bool ui_post_processing_confirm_wallet_spend(dispatcher_context_t *context, bool success);
-
 bool ui_post_processing_confirm_transaction(dispatcher_context_t *context, bool success);
 
 bool ui_post_processing_confirm_message(dispatcher_context_t *context, bool success);
 
 void ui_display_post_processing_confirm_message(bool success);
 void ui_display_post_processing_confirm_transaction(bool success);
-void ui_set_display_prompt(void);
-
-uint8_t get_streaming_index(void);
-void reset_streaming_index(void);
-void increase_streaming_index(void);
-void decrease_streaming_index(void);
 
 /**
  * Functions to get and set the text to be shown when processing.
